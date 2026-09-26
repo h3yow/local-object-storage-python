@@ -130,6 +130,13 @@ def create_router(service: ObjectService) -> APIRouter:
         return {"session_id": session_id, "state": "aborted"}
 
     # --- 读取 / 版本 / 删除 ---
+    # 注意：versions 子路径必须先于 {key:path} 注册，否则会被路径转换器吞掉。
+    @router.get("/namespaces/{namespace}/objects/{key:path}/versions")
+    def list_versions(namespace: str, key: str,
+                      x_access_token: str | None = Header(default=None)) -> dict:
+        service.authorize(namespace, x_access_token, "read")
+        return {"versions": [_version_view(v) for v in service.list_versions(namespace, key)]}
+
     @router.get("/namespaces/{namespace}/objects/{key:path}")
     def get_object(namespace: str, key: str,
                    version: int | None = Query(default=None),
@@ -141,12 +148,6 @@ def create_router(service: ObjectService) -> APIRouter:
         view = _version_view(v)
         view["data_base64"] = base64.b64encode(data).decode()
         return view
-
-    @router.get("/namespaces/{namespace}/objects/{key:path}/versions")
-    def list_versions(namespace: str, key: str,
-                      x_access_token: str | None = Header(default=None)) -> dict:
-        service.authorize(namespace, x_access_token, "read")
-        return {"versions": [_version_view(v) for v in service.list_versions(namespace, key)]}
 
     @router.delete("/namespaces/{namespace}/objects/{key:path}")
     def delete_object(namespace: str, key: str,
