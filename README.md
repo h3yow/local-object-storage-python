@@ -1,0 +1,197 @@
+# local-object-storage
+
+仅依赖**本地文件系统**的对象存储服务（FastAPI）。支持分段上传与断点续传、对象
+版本管理、命名空间级访问授权与存储配额，并对上传中断、重复提交与并发访问提供
+确定、可解释的结果。
+
+无外部数据库、无 Redis：数据全部落在 `OBJECTSTORAGE_ROOT`（默认 `./.objectstore`）
+目录下，所有元数据写入均为「临时文件 + `os.replace`」原子替换，并追加 JSONL 审计
+日志。
+
+> 并发模型：单进程部署（FastAPI 同步路由），进程内以一把 `RLock` 串行化所有
+> “读—判定—写”序列。因此覆盖胜负确定、配额不会被并发突破。多 worker/多进程
+> 部署不在本实现的支持范围内。
+
+## 目录布局
+
+```
+<root>/
+  namespaces.json                 # 命名空间注册表（令牌、配额、已用字节）
+  audit.log                       # 追加式 JSONL 审计日志
+  ns/<namespace>/
+    objects/<urlquoted-name>.json # 单对象元数据：版本链 + 删除标记
+    blobs/<sha256>                # 内容寻址的不可变对象数据
+    uploads/<session_id>/
+      session.json                # 会话状态（open/completed/aborted/expired）
+      parts/<seq>                 # 已接收分段
+```
+
+## 快速开始
+
+```bash
+uv sync
+OBJECTSTORAGE_ROOT=./.objectstore uv run uvicorn main:app --port 8000
+# 健康检查
+curl -s localhost:8000/health
+```
+
+所有业务接口以 `/namespaces/{namespace}/...` 为前缀，令牌通过
+`X-Namespace-Token` 请求头传递（命名空间创建时登记的令牌之一）。
+
+## API 一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/namespaces` | 创建命名空间（配额、令牌） |
+| GET | `/namespaces/{ns}` | 配额用量 |
+| POST | `/namespaces/{ns}/uploads` | 创建分段上传会话 |
+| GET | `/namespaces/{ns}/uploads/{sid}` | 查询会话状态 |
+| PUT | `/namespaces/{ns}/uploads/{sid}/parts/{seq}` | 提交分段 |
+| POST | `/namespaces/{ns}/uploads/{sid}/complete` | 完成上传 |
+| POST | `/namespaces/{ns}/uploads/{sid}/abort` | 中止上传 |
+| GET | `/namespaces/{ns}/objects` | 列对象（含版本链） |
+| GET | `/namespaces/{ns}/objects/{name}` | 对象元数据（`?version=N`） |
+| GET | `/namespaces/{ns}/objects/{name}/content` | 下载（`?version=N`） |
+| DELETE | `/namespaces/{ns}/objects/{name}` | 逻辑删除（保留历史版本） |
+| POST | `/namespaces/{ns}/maintenance/purge-expired` | 回收过期未完成会话 |
+
+## 分段上传与断点续传语义
+
+1. **创建会话**：声明 `object_name`、`total_parts`、整对象 `final_checksum`
+   （sha256 hex）、可选 `expected_version`。会话默认 TTL 24h。
+2. **分段提交**：`PUT .../parts/{seq}`，请求体为原始字节，必须带头
+   `X-Part-Checksum: <sha256(part)>`。
+   - 分段必须按 `1,2,3,...` **严格升序首次提交**；跳跃、乱序、超过
+     `total_parts` 一律返回 `part_out_of_order`（409），响应 details 中带
+     `expected_next` 与已接收序号。
+   - 分段字节与声明摘要不符 → `part_checksum_mismatch`（422），该分段不落盘、
+     不占用序号，可用同一序号重试。
+   - **幂等重放**：重复提交「当前最后一个已接收序号」且摘要/大小一致 →
+     HTTP 200，响应 `"replayed": true`，不重复计入。
+   - 同序号但摘要不同 → `part_conflict`（409），与幂等重放明确区分。
+3. **完成**：所有分段到齐后调用 `complete`。服务顺序组装并重新计算整对象
+   sha256，与 `final_checksum` 不符 → `object_checksum_mismatch`（422），
+   不产生对象、不占配额，会话保持 `open`。缺段 → `parts_incomplete`（409）。
+4. **会话失效**：会话不存在 → `upload_session_not_found`（404）；TTL 过期 →
+   `upload_session_expired`（410）；已完成/已中止后再传分段 →
+   `upload_session_closed`（409，details 标注 completed/aborted）。
+5. **不可见性保证**：只有组装成功且摘要校验通过、blob 落盘后才写对象元数据，
+   因此未完成的上传永远不会出现在列表/下载接口中。
+6. **续传**：中断后先 GET 会话查看 `received_parts`，重放最后一分段后继续
+   提交后续序号即可。
+
+### curl 示例
+
+```bash
+H='X-Namespace-Token: token-a'
+curl -s -XPOST localhost:8000/namespaces -d '{"name":"team-a","quota_bytes":1048576,"tokens":["token-a"]]}' -H 'Content-Type: application/json'
+
+head -c 1048576 /dev/urandom > big.bin
+SID=$(curl -s -XPOST localhost:8000/namespaces/team-a/uploads -H "$H" -H 'Content-Type: application/json' \
+  -d "{\"object_name\":\"big.bin\",\"total_parts\":2,\"final_checksum\":\"$(sha256sum big.bin | cut -d' ' -f1)\"}" | python -c 'import sys,json;print(json.load(sys.stdin)["session_id"])')
+
+split -n 2 -d big.bin part-
+for i in 0 1; do
+  curl -s -XPUT "localhost:8000/namespaces/team-a/uploads/$SID/parts/$((i+1))" \
+    -H "$H" -H "X-Part-Checksum: $(sha256sum part-0$i | cut -d' ' -f1)" \
+    --data-binary @part-0$i
+done
+curl -s -XPOST "localhost:8000/namespaces/team-a/uploads/$SID/complete" -H "$H"
+```
+
+## 版本与覆盖语义
+
+- 每次成功完成上传产生一个**单调递增**版本号（v1, v2, ...）。覆盖写响应
+  `outcome=created|replaced`、`replaced_version`，并附 `decision` 判定依据；
+  历史版本元数据与 blob 全部保留，可 `?version=N` 读取。
+- 对象元数据先于 blob？**顺序相反**：blob（内容寻址、不可变）先就位，再原子
+  替换对象元数据文件，因此任何时刻都不会读到「元数据有了、数据还没写完」的
+  部分写入。
+- **并发覆盖有确定胜负**：所有 complete 在同一把锁内串行执行，按提交顺序依次
+  分配 v=N+1。测试中 10 个并发覆盖产生连续版本 2..11，无一丢失，每个成功提交
+  都可在版本链中回溯，最终 current 指向锁排序的最后一个写入者。
+- **乐观并发（可选）**：创建会话时传 `expected_version`（对象不存在传 `0`）。
+  complete 时若当前版本已变化 → `version_conflict`（409），details 给出
+  `expected_version` 与 `actual_version`；失败方不产生任何版本、不暴露部分
+  写入。
+- **删除**为逻辑删除：置删除标记，默认下载返回 `object_not_found`（details 中
+  `delete_marker=true`），但版本链保留、可按版本访问；删除后重新上传视为
+  created，版本号在历史链上继续递增。当前版本引用的 blob 若无其他对象引用则
+  立即回收并回补配额（相同内容的不同对象共享内容寻址 blob，引用计数检查保证
+  不会误删）。
+
+## 配额规则
+
+- 配额在命名空间创建时以字节设定（`quota_bytes=0` 表示不限）。
+- 判定发生在 complete 时、同一把锁内：
+  `projected = used + 新对象大小 - 被替换当前版本大小`。
+  `projected > quota` → `quota_exceeded`（413），details 含 `used/quota/
+  projected/incoming_size`；此时对象不出现、配额不增加、临时组装文件被清理。
+- 并发写入因此不可能突破配额：锁保证“检查—提交”原子（测试：20 个 10 字节
+  并发写入、配额 100，恰好 10 个成功、10 个得到 `quota_exceeded`，
+  used 恰为 100）。
+- 删除对象会释放当前版本独占的 blob 字节数。
+
+## 授权规则
+
+- 未带头 / 空令牌 → `missing_credentials`（401）。
+- 命名空间不存在 → `namespace_not_found`（404）。
+- 令牌不在该命名空间令牌列表中 → `namespace_access_denied`（403）。
+- 每个命名空间持有独立令牌集合，跨命名空间令牌无效。
+
+## 错误分类（稳定 error_code）
+
+所有错误响应体形如：
+
+```json
+{"error": {"code": "part_out_of_order",
+           "message": "parts must be submitted ...",
+           "details": {"part": 3, "expected_next": 2, "received": [1]}}}
+```
+
+| HTTP | error_code | 触发条件 |
+| --- | --- | --- |
+| 401 | `missing_credentials` | 未提供令牌 |
+| 403 | `namespace_access_denied` | 令牌不属于该命名空间 |
+| 404 | `namespace_not_found` / `object_not_found` / `version_not_found` / `upload_session_not_found` | 对应资源不存在 |
+| 409 | `part_out_of_order` | 分段乱序/跳跃/越界 |
+| 422 | `part_checksum_mismatch` | 分段摘要不符 |
+| 409 | `part_conflict` | 同序号分段摘要不同 |
+| 409 | `parts_incomplete` | 完成时有缺段 |
+| 422 | `object_checksum_mismatch` | 组装后摘要不符 |
+| 410 | `upload_session_expired` | 会话超过 TTL |
+| 409 | `upload_session_closed` | 会话已完成/中止 |
+| 409 | `version_conflict` | 乐观并发版本不匹配 |
+| 413 | `quota_exceeded` | 写入将突破配额 |
+
+## 过期清理与数据可追溯
+
+- `POST /maintenance/purge-expired` 将所有 TTL 过期且仍 open 的会话标记为
+  `expired`，删除其 `parts/` 目录；`session.json` 保留为留痕，不会产生对象或
+  悬挂数据。abort 同理（状态 `aborted` + 回收分段）。
+- 每个关键动作（会话创建/分段接收/幂等重放/完成/拒绝原因/删除/回收）都写
+  `audit.log`（JSONL）并通过 `object_storage` logger 打印，包含 session_id、
+  object、version 与 `decision` 判定依据。
+
+## 本地验证
+
+```bash
+uv sync
+uv run pytest -q          # 26 个用例
+uv run pytest -s          # 同时查看会话/版本/判定依据日志
+```
+
+测试覆盖：
+
+- 中断续传与重复分段幂等（`tests/test_multipart.py`）
+- 分段摘要错误、对象摘要错误、乱序、缺段、过期/已关闭会话（错误码可区分）
+- 并发覆盖确定性、乐观并发失败、旧版本可回溯（`tests/test_versions.py`，
+  含 10 线程竞争）
+- 越权（401/403/404 区分）、超配额（413）、20 线程并发配额不超限、
+  删除释放与共享 blob 保护、过期会话回收（`tests/test_auth_quota.py`）
+- REST 端到端错误码与续传下载（`tests/test_api.py`）
+
+## 局限
+
+- 单进程并发模型；需要多实例时应替换为带文件锁/外部锁的实现。
+- 令牌以明文存于注册表，适合本地/内网验证，不适合作为公网授权方案。
