@@ -15,6 +15,12 @@ class StorageError(Exception):
         self.detail = detail or {}
 
 
+# --- 命名空间相关 ---
+class NamespaceNotFoundError(StorageError):
+    status_code = 404
+    reason = "namespace_not_found"
+
+
 # --- 上传会话 / 分段相关 ---
 class SessionNotFoundError(StorageError):
     status_code = 404
@@ -44,6 +50,11 @@ class PartSizeError(StorageError):
 class PartChecksumError(StorageError):
     status_code = 400
     reason = "part_checksum_mismatch"
+
+
+class PartConflictError(StorageError):
+    status_code = 409
+    reason = "part_conflict"
 
 
 class DigestMismatchError(StorageError):
