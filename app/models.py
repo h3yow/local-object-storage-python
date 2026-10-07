@@ -11,13 +11,23 @@ class NamespaceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     quota_bytes: int = Field(default=0, ge=0, description="0 表示不限制")
     tokens: list[str] = Field(default_factory=list, description="授权令牌列表")
+    max_history_versions: int = Field(
+        default=0, ge=0,
+        description="每个对象最多保留的版本数（含当前版本）；0 表示不限制")
 
 
 class NamespaceInfo(BaseModel):
     name: str
     quota_bytes: int
     used_bytes: int
+    inflight_bytes: int = 0
+    max_history_versions: int = 0
     tokens: list[str]
+
+
+class PolicyUpdate(BaseModel):
+    max_history_versions: int = Field(
+        ge=0, description="每个对象最多保留的版本数（含当前版本）；0 表示不限制")
 
 
 # ---- 上传会话 ----
@@ -40,6 +50,7 @@ class SessionInfo(BaseModel):
     object_name: str
     total_parts: int
     received_parts: list[int]
+    inflight_bytes: int = 0
     status: str  # open | completed | aborted | expired
     expires_at: str
 
@@ -53,6 +64,7 @@ class VersionInfo(BaseModel):
     metadata: dict[str, str]
     created_at: str
     session_id: str | None = None
+    restored_from: int | None = None
 
 
 class ObjectInfo(BaseModel):
@@ -72,6 +84,21 @@ class CompleteResult(BaseModel):
     size: int
     outcome: str  # created | replaced
     decision: str  # 判定依据（用于日志/可解释性）
+
+
+class RestoreRequest(BaseModel):
+    version: int = Field(ge=1, description="要恢复的历史版本号")
+
+
+class RestoreResult(BaseModel):
+    namespace: str
+    object_name: str
+    version: int  # 恢复产生的新当前版本号
+    restored_from: int  # 被恢复的历史版本号
+    checksum: str
+    size: int
+    was_delete_marker: bool  # 恢复前对象是否处于已删除状态
+    decision: str  # 判定依据
 
 
 class ListResult(BaseModel):

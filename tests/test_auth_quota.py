@@ -65,18 +65,21 @@ def test_service_level_auth_errors_distinct(service, make_namespace):
 # ---------------- 配额 ----------------
 def test_quota_blocks_oversized_write_with_partial_exposure(
         service, make_namespace):
+    """在途字节计入配额：11 字节分段在配额 10 下于分段提交时即被拒。"""
     make_namespace(quota_bytes=10)
     body = SessionCreate(object_name="big.bin", total_parts=1,
                          final_checksum=sha256(b"x" * 11))
     s = service.create_session("team-a", "token-a", body)
-    service.upload_part("team-a", s.session_id, 1, b"x" * 11, sha256(b"x" * 11))
     with pytest.raises(QuotaExceeded) as ei:
-        service.complete_session("team-a", s.session_id)
+        service.upload_part("team-a", s.session_id, 1, b"x" * 11,
+                            sha256(b"x" * 11))
     assert ei.value.error_code == "quota_exceeded"
     assert ei.value.details["projected"] == 11
-    log.info("超配额被拒 依据=%s", ei.value.details)
+    assert ei.value.details["reason"] == "inflight_bytes"
+    log.info("超配额被拒（在途计入） 依据=%s", ei.value.details)
     # 配额未被占用，且对象不可见
-    assert service.get_namespace_info("team-a").used_bytes == 0
+    info = service.get_namespace_info("team-a")
+    assert info.used_bytes == 0 and info.inflight_bytes == 0
     assert service.store.get_object_meta("team-a", "big.bin") is None
     # 临时组装文件已清理
     leftover = list((service.store.root / "ns/team-a/blobs").glob(".assemble-*"))
@@ -95,13 +98,15 @@ def test_quota_accounts_for_replaced_version(service, make_namespace):
         log.info("配额内覆盖 v%s size=%d used=%s", res.version, len(content),
                  service.get_namespace_info("team-a").used_bytes)
     assert service.get_namespace_info("team-a").used_bytes == 10
-    # 再增大 1 字节则拒绝
+    # 再增大 1 字节：分段提交时即被拒（在途计入配额，覆盖抵扣后仍超限）
     body = SessionCreate(object_name="grow.bin", total_parts=1,
                          final_checksum=sha256(b"d" * 11))
     s = service.create_session("team-a", "token-a", body)
-    service.upload_part("team-a", s.session_id, 1, b"d" * 11, sha256(b"d" * 11))
-    with pytest.raises(QuotaExceeded):
-        service.complete_session("team-a", s.session_id)
+    with pytest.raises(QuotaExceeded) as ei:
+        service.upload_part("team-a", s.session_id, 1, b"d" * 11,
+                            sha256(b"d" * 11))
+    assert ei.value.details["reason"] == "inflight_bytes"
+    log.info("覆盖超配额被拒 依据=%s", ei.value.details)
     # 对象保持上一版本，未出现部分写入
     _, path, v = service.get_object("team-a", "grow.bin")
     assert v == 3 and path.read_bytes() == b"cccccccccc"
@@ -109,44 +114,55 @@ def test_quota_accounts_for_replaced_version(service, make_namespace):
 
 
 def test_concurrent_writes_never_breach_quota(service, make_namespace):
-    """20 个并发对象各写 10 字节，配额 100：恰好 10 个成功，其余 quota_exceeded。"""
+    """20 个会话各传 10 字节、配额 100：在途计入后只有 10 个分段被接收，
+    其余在分段提交时即得到 quota_exceeded；并发完成全部成功且不超限。"""
     make_namespace(quota_bytes=100)
-    sessions = []
+    accepted, rejected = [], []
     for i in range(20):
         payload = f"c{i:02d}".encode().ljust(10, b"!")
         assert len(payload) == 10
         body = SessionCreate(object_name=f"c{i:02d}.bin", total_parts=1,
                              final_checksum=sha256(payload))
         s = service.create_session("team-a", "token-a", body)
-        service.upload_part("team-a", s.session_id, 1, payload, sha256(payload))
-        sessions.append((s.session_id, f"c{i:02d}.bin"))
+        try:
+            service.upload_part("team-a", s.session_id, 1, payload,
+                                sha256(payload))
+            accepted.append((s.session_id, f"c{i:02d}.bin"))
+        except QuotaExceeded as e:
+            rejected.append((e.error_code, f"c{i:02d}.bin"))
 
-    outcomes, rejections = [], []
+    # 在途字节把配额占满：恰好 10 个分段被接收，10 个被拒且原因可区分
+    assert len(accepted) == 10 and len(rejected) == 10
+    assert all(code == "quota_exceeded" for code, _ in rejected)
+    ns_info = service.get_namespace_info("team-a")
+    assert ns_info.inflight_bytes == 100 and ns_info.used_bytes == 0
+    log.info("在途配额判定 接收=%d 拒绝=%d inflight=%d quota=100",
+             len(accepted), len(rejected), ns_info.inflight_bytes)
+
+    outcomes, errors = [], []
 
     def _commit(item):
         sid, name = item
         try:
             r = service.complete_session("team-a", sid)
             return ("ok", r.version, name)
-        except QuotaExceeded as e:
-            return ("quota", e.error_code, name)
         except Exception as e:  # noqa: BLE001
             return ("other", str(e), name)
 
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        results = list(pool.map(_commit, sessions))
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(_commit, accepted))
     for kind, *rest in results:
-        (outcomes if kind == "ok" else rejections).append(rest)
+        (outcomes if kind == "ok" else errors).append(rest)
 
     used = service.get_namespace_info("team-a").used_bytes
-    log.info("配额并发判定 成功=%d 拒绝=%d used=%d quota=100 拒绝原因集合=%s",
-             len(outcomes), len(rejections), used,
-             {r[0] for r in rejections})
+    inflight = service.get_namespace_info("team-a").inflight_bytes
+    log.info("配额并发判定 成功=%d 失败=%d used=%d inflight=%d quota=100",
+             len(outcomes), len(errors), used, inflight)
+    assert errors == []
     assert len(outcomes) == 10
-    assert used == 100
-    assert all(r[0] == "quota_exceeded" for r in rejections)
+    assert used == 100 and inflight == 0  # 在途全部转为正式占用
     # 被拒对象均不可见
-    for _, name in rejections:
+    for _, name in rejected:
         assert service.store.get_object_meta("team-a", name) is None
 
 

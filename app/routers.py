@@ -20,6 +20,9 @@ from .models import (
     NamespaceCreate,
     NamespaceInfo,
     ObjectInfo,
+    PolicyUpdate,
+    RestoreRequest,
+    RestoreResult,
     SessionCreate,
     SessionInfo,
 )
@@ -54,6 +57,15 @@ def create_namespace(body: NamespaceCreate,
 @router.get("/namespaces/{namespace}", response_model=NamespaceInfo)
 def get_namespace(namespace: str,
                   svc: ObjectService = Depends(get_service)) -> NamespaceInfo:
+    return svc.get_namespace_info(namespace)
+
+
+@router.put("/namespaces/{namespace}/policy", response_model=NamespaceInfo)
+def update_policy(namespace: str, body: PolicyUpdate,
+                  x_namespace_token: str | None = Header(default=None),
+                  svc: ObjectService = Depends(get_service)) -> NamespaceInfo:
+    svc.authorize(namespace, _token(x_namespace_token))
+    svc.update_policy(namespace, body.max_history_versions)
     return svc.get_namespace_info(namespace)
 
 
@@ -149,10 +161,24 @@ def stat_object(namespace: str, object_name: str,
 
 @router.delete("/namespaces/{namespace}/objects/{object_name:path}")
 def delete_object(namespace: str, object_name: str,
+                  version: int | None = Query(default=None),
                   x_namespace_token: str | None = Header(default=None),
                   svc: ObjectService = Depends(get_service)) -> dict:
     svc.authorize(namespace, _token(x_namespace_token))
+    if version is not None:
+        # 删除指定历史版本；当前生效版本由服务端拒绝
+        return svc.delete_version(namespace, object_name, version)
     return svc.delete_object(namespace, object_name)
+
+
+# 注意：/restore 子路径必须在 {object_name:path} 通配（GET 元数据）之前注册。
+@router.post("/namespaces/{namespace}/objects/{object_name:path}/restore",
+             response_model=RestoreResult, status_code=201)
+def restore_object(namespace: str, object_name: str, body: RestoreRequest,
+                   x_namespace_token: str | None = Header(default=None),
+                   svc: ObjectService = Depends(get_service)) -> RestoreResult:
+    svc.authorize(namespace, _token(x_namespace_token))
+    return svc.restore_object(namespace, object_name, body.version)
 
 
 # ---------- 运维：回收过期会话 ----------

@@ -57,15 +57,14 @@ def test_http_error_codes_are_distinguishable(client, make_namespace):
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "namespace_access_denied"
 
-    # 合法上传但超配额 -> 413
+    # 合法上传但超配额 -> 413（在途字节计入配额，分段提交时即拒）
     blob = b"x" * 6
     r = client.post("/namespaces/ns1/uploads", headers=h1,
                     json={"object_name": "big", "total_parts": 1,
                           "final_checksum": sha256(blob)})
     sid = r.json()["session_id"]
-    client.put(f"/namespaces/ns1/uploads/{sid}/parts/1",
-               headers={**h1, "X-Part-Checksum": sha256(blob)}, content=blob)
-    r = client.post(f"/namespaces/ns1/uploads/{sid}/complete", headers=h1)
+    r = client.put(f"/namespaces/ns1/uploads/{sid}/parts/1",
+                   headers={**h1, "X-Part-Checksum": sha256(blob)}, content=blob)
     assert r.status_code == 413
     assert r.json()["error"]["code"] == "quota_exceeded"
     log.info("HTTP 超配额响应 details=%s", r.json()["error"]["details"])

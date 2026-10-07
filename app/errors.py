@@ -129,6 +129,13 @@ class QuotaExceeded(ServiceError):
     error_code = "quota_exceeded"
 
 
+class CannotDeleteCurrentVersion(ServiceError):
+    """当前生效版本不允许被单独删除 (409)。"""
+
+    status_code = 409
+    error_code = "cannot_delete_current_version"
+
+
 class ObjectLocked(ServiceError):
     """对象上存在进行中的覆盖判定（理论上由锁串行化，兜底用）。"""
 

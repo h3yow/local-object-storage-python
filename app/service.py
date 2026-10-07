@@ -19,6 +19,7 @@ from .models import (
     NamespaceCreate,
     NamespaceInfo,
     ObjectInfo,
+    RestoreResult,
     SessionCreate,
     SessionInfo,
     VersionInfo,
@@ -76,7 +77,10 @@ class ObjectService:
     def _ns_info(rec: dict[str, Any]) -> NamespaceInfo:
         return NamespaceInfo(
             name=rec["name"], quota_bytes=rec["quota_bytes"],
-            used_bytes=rec.get("used_bytes", 0), tokens=list(rec.get("tokens", [])),
+            used_bytes=rec.get("used_bytes", 0),
+            inflight_bytes=rec.get("inflight_bytes", 0),
+            max_history_versions=rec.get("max_history_versions", 0),
+            tokens=list(rec.get("tokens", [])),
         )
 
     def authorize(self, namespace: str, token: str | None) -> dict[str, Any]:
@@ -112,6 +116,7 @@ class ObjectService:
                 "metadata": body.metadata,
                 "expected_version": body.expected_version,
                 "parts": {},  # seq -> {"checksum": ..., "size": ...}
+                "inflight_bytes": 0,  # 已计入命名空间配额的在途字节
                 "status": "open",
                 "created_at": created,
                 "expires_at": expires,
@@ -129,6 +134,43 @@ class ObjectService:
                      body.total_parts, body.expected_version)
             return self._session_info(session)
 
+    # ---- 在途字节（inflight）配额记账：以下方法均须在 store 锁内调用 ----
+    def _live_current_size(self, namespace: str, object_name: str) -> int:
+        """对象当前生效版本的逻辑大小；不存在或已删除则为 0。"""
+        meta = self.store.get_object_meta(namespace, object_name)
+        if meta is None or meta.get("delete_marker", False):
+            return 0
+        return next((v["size"] for v in meta["versions"]
+                     if v["version"] == meta["current_version"]), 0)
+
+    def _add_inflight(self, namespace: str, delta: int) -> int:
+        rec = self.store.get_namespace(namespace)
+        new_value = max(0, rec.get("inflight_bytes", 0) + delta)
+        self.store.update_namespace(namespace, inflight_bytes=new_value)
+        return new_value
+
+    def _release_session_inflight(self, namespace: str,
+                                  session: dict[str, Any]) -> int:
+        """释放会话仍占用的在途字节；幂等（释放后归零，重复调用为 0）。"""
+        charged = session.get("inflight_bytes", 0)
+        if charged:
+            self._add_inflight(namespace, -charged)
+            session["inflight_bytes"] = 0
+        return charged
+
+    def _expire_session_locked(self, namespace: str,
+                               session: dict[str, Any]) -> None:
+        """惰性过期：置状态并释放在途配额；分段数据由回收路径统一清理。"""
+        session["status"] = "expired"
+        released = self._release_session_inflight(namespace, session)
+        self.store.save_session(namespace, session)
+        self.store.append_audit(
+            {"action": "session_expire", "namespace": namespace,
+             "session_id": session["session_id"],
+             "decision": f"ttl_expired,inflight_released={released}"})
+        log.info("session_expire sid=%s ns=%s inflight_released=%d",
+                 session["session_id"], namespace, released)
+
     def _get_open_session(self, namespace: str, session_id: str) -> dict[str, Any]:
         session = self.store.load_session(namespace, session_id)
         if session is None:
@@ -142,9 +184,8 @@ class ObjectService:
                                        details={"session_id": session_id,
                                                 "status": "aborted"})
         if parse_iso(session["expires_at"]) <= utcnow():
-            # 惰性过期：仅改状态，目录由回收统一清理。
-            session["status"] = "expired"
-            self.store.save_session(namespace, session)
+            # 惰性过期：置状态、释放在途配额并回收分段。
+            self._expire_session_locked(namespace, session)
             raise errors.SessionExpired(
                 "upload session expired",
                 details={"session_id": session_id,
@@ -159,8 +200,7 @@ class ObjectService:
         # 读取时顺带做惰性过期判定，保证状态可解释
         if session["status"] == "open" and parse_iso(session["expires_at"]) <= utcnow():
             with self.store.lock():
-                session["status"] = "expired"
-                self.store.save_session(namespace, session)
+                self._expire_session_locked(namespace, session)
         return self._session_info(session)
 
     def abort_session(self, namespace: str, session_id: str) -> SessionInfo:
@@ -170,11 +210,13 @@ class ObjectService:
                 raise errors.SessionNotFound(f"upload session {session_id!r} not found")
             if session["status"] in ("open", "expired"):
                 session["status"] = "aborted"
+                released = self._release_session_inflight(namespace, session)
                 self.store.save_session(namespace, session)
                 self.store.append_audit(
                     {"action": "session_abort", "namespace": namespace,
                      "session_id": session_id,
-                     "decision": "aborted,parts_reclaimed"})
+                     "decision": f"aborted,inflight_released={released},"
+                                 "parts_reclaimed"})
             self.store.remove_session_parts(namespace, session_id)
             log.info("session_abort sid=%s ns=%s status=%s", session_id,
                      namespace, session["status"])
@@ -234,6 +276,38 @@ class ObjectService:
                              "total_parts": total},
                 )
 
+            # 在途字节计入配额：已收到但未完成的分段同样占用配额，
+            # 并发上传不会在 complete 时才一起挤爆配额。
+            # 覆盖写可抵扣本对象当前版本占用（complete 时会释放它），
+            # 因此"配额已满时同尺寸覆盖"依然可行；抵扣额度只有一个，
+            # 已被其它在途会话的 inflight 占用后不可重复使用。
+            nsrec = self.store.get_namespace(namespace)
+            quota = nsrec.get("quota_bytes", 0) or 0
+            if quota:
+                used = nsrec.get("used_bytes", 0)
+                inflight = nsrec.get("inflight_bytes", 0)
+                replaceable = self._live_current_size(
+                    namespace, session["object_name"])
+                projected = used - replaceable + inflight + len(data)
+                if projected > quota:
+                    decision = (f"quota_inflight:used={used},inflight={inflight},"
+                                f"replaceable={replaceable},"
+                                f"part_size={len(data)},projected={projected},"
+                                f"quota={quota}")
+                    self.store.append_audit(
+                        {"action": "part_reject", "namespace": namespace,
+                         "session_id": session_id, "part": seq,
+                         "reason": "quota_exceeded", "decision": decision})
+                    log.warning("part_reject sid=%s part=%d %s",
+                                session_id, seq, decision)
+                    raise errors.QuotaExceeded(
+                        "accepting this part would exceed namespace quota",
+                        details={"used": used, "inflight": inflight,
+                                 "quota": quota, "projected": projected,
+                                 "part_size": len(data),
+                                 "reason": "inflight_bytes"},
+                    )
+
             dst = self.store.part_path(namespace, session_id, seq)
             dst.parent.mkdir(parents=True, exist_ok=True)
             tmp = dst.with_name(dst.name + ".tmp")
@@ -242,14 +316,20 @@ class ObjectService:
                 f.flush()
             os.replace(tmp, dst)
             parts[str(seq)] = {"checksum": declared_checksum, "size": len(data)}
+            session["inflight_bytes"] = session.get("inflight_bytes", 0) + len(data)
+            inflight_after = self._add_inflight(namespace, len(data))
             self.store.save_session(namespace, session)
             self.store.append_audit(
                 {"action": "part_accept", "namespace": namespace,
                  "session_id": session_id, "part": seq,
                  "size": len(data), "checksum": declared_checksum,
-                 "received_count": len(parts)})
-            log.info("part_accept sid=%s part=%d/%d size=%d checksum=%s",
-                     session_id, seq, total, len(data), declared_checksum)
+                 "received_count": len(parts),
+                 "decision": f"inflight_charged={len(data)},"
+                             f"ns_inflight={inflight_after}"})
+            log.info("part_accept sid=%s part=%d/%d size=%d checksum=%s "
+                     "ns_inflight=%d",
+                     session_id, seq, total, len(data), declared_checksum,
+                     inflight_after)
             return {"part": seq, "checksum": declared_checksum, "replayed": False,
                     "next_expected": seq + 1}
 
@@ -322,18 +402,24 @@ class ObjectService:
                         details={"assembled": size, "sum_parts": total_size},
                     )
 
-                # 配额判定（在锁内，先查旧版本占用再决定）
+                # 配额判定（在锁内，先查旧版本占用再决定）。
+                # 本会话的在途字节已在分段提交时计入配额，这里把
+                # inflight 转换为 used；总占用 = used + 其它会话 inflight。
                 quota = nsrec.get("quota_bytes", 0) or 0
                 used = nsrec.get("used_bytes", 0)
+                inflight = nsrec.get("inflight_bytes", 0)
+                session_inflight = session.get("inflight_bytes", 0)
                 old_size = 0
                 if live_meta:
                     old_size = next(
                         (v["size"] for v in meta["versions"]
                          if v["version"] == current_version), 0)
                 projected = used + total_size - old_size
-                if quota and projected > quota:
+                projected_consumption = projected + (inflight - session_inflight)
+                if quota and projected_consumption > quota:
                     decision = (f"quota:used={used},new={total_size},"
                                 f"replace_old={old_size},projected={projected},"
+                                f"other_inflight={inflight - session_inflight},"
                                 f"quota={quota}")
                     self.store.append_audit(
                         {"action": "complete_reject", "namespace": namespace,
@@ -345,6 +431,7 @@ class ObjectService:
                         "write would exceed namespace quota",
                         details={"used": used, "quota": quota,
                                  "projected": projected,
+                                 "inflight": inflight,
                                  "incoming_size": total_size},
                     )
 
@@ -381,10 +468,14 @@ class ObjectService:
 
                 # 先持久化元数据（未完成的对象永远不会出现：blob 已就位才写）
                 self.store.put_object_meta(namespace, meta)
-                self.store.update_namespace(namespace, used_bytes=projected)
+                # 在途字节转为正式占用：used 增加净额，inflight 释放本会话部分
+                self.store.update_namespace(
+                    namespace, used_bytes=projected,
+                    inflight_bytes=max(0, inflight - session_inflight))
 
                 session["status"] = "completed"
                 session["completed_version"] = version_no
+                session["inflight_bytes"] = 0
                 self.store.save_session(namespace, session)
                 # 保留 session.json 作为完成留痕，只回收分段数据
                 self.store.remove_session_parts(namespace, session_id)
@@ -470,6 +561,7 @@ class ObjectService:
             session_id=s["session_id"], namespace=s["namespace"],
             object_name=s["object_name"], total_parts=s["total_parts"],
             received_parts=sorted(int(k) for k in s.get("parts", {})),
+            inflight_bytes=s.get("inflight_bytes", 0),
             status=s["status"], expires_at=s["expires_at"])
 
     def delete_object(self, namespace: str, object_name: str) -> dict[str, Any]:
@@ -508,24 +600,43 @@ class ObjectService:
                     "history_retained": len(meta["versions"]),
                     "bytes_freed": freed}
 
+    # ================= 历史版本保留策略 / 版本删除 / 恢复 =================
+    def update_policy(self, namespace: str, max_history_versions: int
+                      ) -> dict[str, Any]:
+        """更新命名空间版本保留策略并立即对存量对象生效。"""
+        raise NotImplementedError
+
+    def delete_version(self, namespace: str, object_name: str, version: int
+                       ) -> dict[str, Any]:
+        """手动删除指定历史版本（当前生效版本不允许删除）。"""
+        raise NotImplementedError
+
+    def restore_object(self, namespace: str, object_name: str, version: int
+                       ) -> RestoreResult:
+        """把指定历史版本恢复为新的当前版本。"""
+        raise NotImplementedError
+
     # ================= 回收 =================
     def purge_expired_sessions(self, namespace: str) -> dict[str, Any]:
-        """回收过期未完成会话：状态置 expired 并删除其分段目录，不触碰对象数据。"""
+        """回收过期会话：open 且超 TTL 的先置 expired（释放在途配额），
+        再统一删除分段目录；session.json 保留为留痕。"""
         with self.store.lock():
             now = utcnow()
             purged = []
             for s in self.store.all_sessions(namespace):
-                if s["status"] in ("completed", "aborted"):
+                if s["status"] not in ("open", "expired"):
                     continue
-                if parse_iso(s["expires_at"]) <= now:
-                    s["status"] = "expired"
-                    self.store.save_session(namespace, s)
-                    self.store.remove_session_parts(namespace, s["session_id"])
-                    purged.append(s["session_id"])
-                    self.store.append_audit(
-                        {"action": "session_purge", "namespace": namespace,
-                         "session_id": s["session_id"],
-                         "decision": "ttl_expired,parts_reclaimed"})
-                    log.info("session_purge sid=%s ns=%s", s["session_id"], namespace)
+                if s["status"] == "open":
+                    if parse_iso(s["expires_at"]) > now:
+                        continue
+                    self._expire_session_locked(namespace, s)
+                self.store.remove_session_parts(namespace, s["session_id"])
+                purged.append(s["session_id"])
+                self.store.append_audit(
+                    {"action": "session_purge", "namespace": namespace,
+                     "session_id": s["session_id"],
+                     "decision": "ttl_expired,parts_reclaimed,"
+                                 "inflight_released"})
+                log.info("session_purge sid=%s ns=%s", s["session_id"], namespace)
             return {"purged": purged, "count": len(purged)}
 
