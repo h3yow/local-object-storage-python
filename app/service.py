@@ -58,13 +58,18 @@ class ObjectService:
                 raise errors.ServiceError(
                     f"namespace {body.name!r} already exists",
                 )
-            rec = self.store.create_namespace(body.name, body.quota_bytes, body.tokens)
+            rec = self.store.create_namespace(
+                body.name, body.quota_bytes, body.tokens,
+                max_history_versions=body.max_history_versions)
             self.store.append_audit(
                 {"action": "namespace_create", "namespace": body.name,
-                 "quota_bytes": body.quota_bytes, "tokens": body.tokens}
+                 "quota_bytes": body.quota_bytes, "tokens": body.tokens,
+                 "max_history_versions": body.max_history_versions}
             )
-            log.info("namespace_create name=%s quota=%s tokens=%d",
-                     body.name, body.quota_bytes, len(body.tokens))
+            log.info("namespace_create name=%s quota=%s tokens=%d "
+                     "max_history_versions=%d",
+                     body.name, body.quota_bytes, len(body.tokens),
+                     body.max_history_versions)
             return self._ns_info(rec)
 
     def get_namespace_info(self, namespace: str) -> NamespaceInfo:
@@ -466,6 +471,11 @@ class ObjectService:
                 meta["current_version"] = version_no
                 meta["delete_marker"] = False
 
+                # 版本保留策略：超出上限的最老历史版本立即清理
+                limit = nsrec.get("max_history_versions", 0) or 0
+                pruned = self._apply_retention_locked(namespace, meta, limit)
+                pruned_versions = [p["version"] for p in pruned]
+
                 # 先持久化元数据（未完成的对象永远不会出现：blob 已就位才写）
                 self.store.put_object_meta(namespace, meta)
                 # 在途字节转为正式占用：used 增加净额，inflight 释放本会话部分
@@ -483,12 +493,14 @@ class ObjectService:
                 outcome = "replaced" if live_meta else "created"
                 decision = (f"serialized_commit:{outcome},new_version={version_no},"
                             f"previous_version={current_version or 'none'},"
-                            f"lock=store_rlock,quota_after={projected}")
+                            f"lock=store_rlock,quota_after={projected},"
+                            f"retention_pruned={pruned_versions or 'none'}")
                 self.store.append_audit(
                     {"action": "session_complete", "namespace": namespace,
                      "session_id": session_id, "object": object_name,
                      "version": version_no, "outcome": outcome,
                      "checksum": checksum, "size": total_size,
+                     "retention_pruned": pruned_versions,
                      "decision": decision})
                 log.info("session_complete sid=%s object=%s version=%d outcome=%s %s",
                          session_id, object_name, version_no, outcome, decision)
@@ -565,24 +577,31 @@ class ObjectService:
             status=s["status"], expires_at=s["expires_at"])
 
     def delete_object(self, namespace: str, object_name: str) -> dict[str, Any]:
-        """逻辑删除：置删除标记并回收当前版本不再被引用的 blob，历史版本保留可回溯。"""
+        """逻辑删除：置删除标记并释放当前版本的配额占用。
+
+        所有版本（含当前版本）的 blob 全部保留——版本链中凡可查到的版本
+        必须始终可读、可恢复；磁盘空间由保留策略或手动版本删除回收。
+        重复删除幂等：不重复释放配额。
+        """
         with self.store.lock():
             meta = self.store.get_object_meta(namespace, object_name)
             if meta is None:
                 raise errors.ObjectNotFound(f"object {object_name!r} not found")
-            reclaimed = 0
-            freed = 0
-            # 当前版本 blob 若没有其他对象引用则回收
+            if meta.get("delete_marker", False):
+                self.store.append_audit(
+                    {"action": "object_delete", "namespace": namespace,
+                     "object": object_name,
+                     "current_version": meta["current_version"],
+                     "decision": "already_deleted,idempotent_noop"})
+                log.info("object_delete ns=%s object=%s 已删除，幂等空操作",
+                         namespace, object_name)
+                return {"deleted": True, "object": object_name,
+                        "current_version": meta["current_version"],
+                        "history_retained": len(meta["versions"]),
+                        "bytes_freed": 0, "already_deleted": True}
             cur = next((v for v in meta["versions"]
                         if v["version"] == meta["current_version"]), None)
-            if cur is not None:
-                before = self.store.blob_path(namespace, cur["checksum"]).exists()
-                removed = self.store.remove_blob_if_unreferferenced(
-                    namespace, cur["checksum"], exclude_object=object_name)
-                if removed or (before and not self.store.blob_path(
-                        namespace, cur["checksum"]).exists()):
-                    reclaimed += 1
-                    freed += cur["size"]
+            freed = cur["size"] if cur is not None else 0
             meta["delete_marker"] = True
             self.store.put_object_meta(namespace, meta)
             nsrec = self.store.get_namespace(namespace)
@@ -591,30 +610,235 @@ class ObjectService:
             self.store.append_audit(
                 {"action": "object_delete", "namespace": namespace,
                  "object": object_name, "current_version": meta["current_version"],
-                 "blobs_reclaimed": reclaimed, "bytes_freed": freed,
-                 "decision": "delete_marker_kept_history"})
-            log.info("object_delete ns=%s object=%s version=%d reclaimed=%d freed=%d",
-                     namespace, object_name, meta["current_version"], reclaimed, freed)
+                 "quota_bytes_freed": freed,
+                 "decision": "delete_marker,quota_released,"
+                             "all_version_blobs_retained"})
+            log.info("object_delete ns=%s object=%s version=%d quota_freed=%d",
+                     namespace, object_name, meta["current_version"], freed)
             return {"deleted": True, "object": object_name,
                     "current_version": meta["current_version"],
                     "history_retained": len(meta["versions"]),
                     "bytes_freed": freed}
 
     # ================= 历史版本保留策略 / 版本删除 / 恢复 =================
+    # 说明：以下方法均须在 store 锁内调用（或由调用方持锁）。
+    # 配额口径：used_bytes 只计"当前生效版本 + 在途分段"（与 v1 一致），
+    # 历史版本不计入配额，因此清理历史版本只释放磁盘、不改动 used_bytes；
+    # 释放的磁盘字节数会写入审计与返回值的 bytes_freed。
+
+    def _blob_in_use_locked(self, namespace: str, checksum: str,
+                            owner_meta: dict[str, Any]) -> bool:
+        """blob 是否仍被引用：owner 内存态版本链 + 其它对象的已持久化版本。"""
+        if any(v["checksum"] == checksum for v in owner_meta["versions"]):
+            return True
+        return self.store.blob_referenced(
+            namespace, checksum, exclude_object=owner_meta["object_name"])
+
+    def _drop_version_locked(self, namespace: str, meta: dict[str, Any],
+                             version_no: int, *, reason: str) -> dict[str, Any]:
+        """从版本链移除一个历史版本；其 blob 无其它引用时回收磁盘。
+
+        当前生效版本（current_version）一律不允许经此路径移除——即使对象
+        已被逻辑删除，保证 current_version 永远指向一条可查、可读的版本。
+        """
+        idx = next((i for i, v in enumerate(meta["versions"])
+                    if v["version"] == version_no), None)
+        if idx is None:
+            raise errors.VersionNotFound(
+                f"version {version_no} not found",
+                details={"object": meta["object_name"],
+                         "requested_version": version_no,
+                         "available": [v["version"] for v in meta["versions"]]})
+        if version_no == meta["current_version"]:
+            raise errors.CannotDeleteCurrentVersion(
+                "current version cannot be deleted individually",
+                details={"object": meta["object_name"],
+                         "current_version": meta["current_version"],
+                         "delete_marker": meta.get("delete_marker", False)})
+        victim = meta["versions"].pop(idx)
+        blob_removed = False
+        if not self._blob_in_use_locked(namespace, victim["checksum"], meta):
+            blob_removed = self.store.remove_blob_if_unreferferenced(
+                namespace, victim["checksum"],
+                exclude_object=meta["object_name"])
+        info = {"version": version_no, "checksum": victim["checksum"],
+                "size": victim["size"], "blob_removed": blob_removed,
+                "bytes_freed": victim["size"] if blob_removed else 0,
+                "reason": reason}
+        self.store.append_audit(
+            {"action": "version_prune", "namespace": namespace,
+             "object": meta["object_name"], **info,
+             "decision": f"reason={reason},blob_removed={blob_removed},"
+                         f"remaining={[v['version'] for v in meta['versions']]}"})
+        log.info("version_prune ns=%s object=%s version=%d reason=%s "
+                 "blob_removed=%s freed=%d", namespace, meta["object_name"],
+                 version_no, reason, blob_removed, info["bytes_freed"])
+        return info
+
+    def _apply_retention_locked(self, namespace: str, meta: dict[str, Any],
+                                limit: int) -> list[dict[str, Any]]:
+        """按"最多保留 limit 个版本（含当前）"裁剪，最老的非当前版本先清。"""
+        pruned: list[dict[str, Any]] = []
+        if not limit:
+            return pruned
+        while len(meta["versions"]) > limit:
+            victim = next((v for v in meta["versions"]
+                           if v["version"] != meta["current_version"]), None)
+            if victim is None:  # 只剩当前版本，不能再清
+                break
+            pruned.append(self._drop_version_locked(
+                namespace, meta, victim["version"], reason="retention"))
+        return pruned
+
     def update_policy(self, namespace: str, max_history_versions: int
                       ) -> dict[str, Any]:
         """更新命名空间版本保留策略并立即对存量对象生效。"""
-        raise NotImplementedError
+        with self.store.lock():
+            rec = self.store.get_namespace(namespace)
+            if rec is None:
+                raise errors.NamespaceNotFound(
+                    f"namespace {namespace!r} not found")
+            self.store.update_namespace(
+                namespace, max_history_versions=max_history_versions)
+            pruned_all: list[dict[str, Any]] = []
+            for meta in self.store.list_object_metas(namespace):
+                pruned = self._apply_retention_locked(
+                    namespace, meta, max_history_versions)
+                if pruned:
+                    self.store.put_object_meta(namespace, meta)
+                    pruned_all.extend(
+                        {"object": meta["object_name"], **p} for p in pruned)
+            freed = sum(p["bytes_freed"] for p in pruned_all)
+            self.store.append_audit(
+                {"action": "policy_update", "namespace": namespace,
+                 "max_history_versions": max_history_versions,
+                 "pruned_count": len(pruned_all), "disk_bytes_freed": freed,
+                 "decision": f"limit={max_history_versions or 'unlimited'},"
+                             f"pruned={len(pruned_all)},disk_freed={freed}"})
+            log.info("policy_update ns=%s max_history_versions=%d pruned=%d "
+                     "disk_freed=%d", namespace, max_history_versions,
+                     len(pruned_all), freed)
+            return {"namespace": namespace,
+                    "max_history_versions": max_history_versions,
+                    "pruned": pruned_all, "pruned_count": len(pruned_all),
+                    "disk_bytes_freed": freed}
 
     def delete_version(self, namespace: str, object_name: str, version: int
                        ) -> dict[str, Any]:
         """手动删除指定历史版本（当前生效版本不允许删除）。"""
-        raise NotImplementedError
+        with self.store.lock():
+            meta = self.store.get_object_meta(namespace, object_name)
+            if meta is None:
+                raise errors.ObjectNotFound(
+                    f"object {object_name!r} not found",
+                    details={"namespace": namespace, "object": object_name})
+            info = self._drop_version_locked(namespace, meta, version,
+                                             reason="manual")
+            self.store.put_object_meta(namespace, meta)
+            return {"object": object_name, "deleted_version": version,
+                    "blob_removed": info["blob_removed"],
+                    "bytes_freed": info["bytes_freed"],
+                    "remaining_versions": [v["version"]
+                                           for v in meta["versions"]]}
 
     def restore_object(self, namespace: str, object_name: str, version: int
                        ) -> RestoreResult:
-        """把指定历史版本恢复为新的当前版本。"""
-        raise NotImplementedError
+        """把指定历史版本恢复为新的当前版本。
+
+        - 对象不存在 -> object_not_found；版本不存在 -> version_not_found；
+        - 对象已被逻辑删除 -> 允许恢复，响应 was_delete_marker=True 可区分；
+        - 新版本号在既有历史之上 +1（版本号永不重用），内容/类型/元信息
+          与源版本完全一致（共享同一内容寻址 blob），历史一条不丢；
+        - 恢复产生的新当前版本计入配额（抵扣被替换的当前版本）。
+        """
+        with self.store.lock():
+            meta = self.store.get_object_meta(namespace, object_name)
+            if meta is None:
+                raise errors.ObjectNotFound(
+                    f"object {object_name!r} not found",
+                    details={"namespace": namespace, "object": object_name})
+            src = next((v for v in meta["versions"]
+                        if v["version"] == version), None)
+            if src is None:
+                raise errors.VersionNotFound(
+                    f"version {version} not found",
+                    details={"object": object_name,
+                             "requested_version": version,
+                             "available": [v["version"]
+                                           for v in meta["versions"]]})
+            blob = self.store.blob_path(namespace, src["checksum"])
+            if not blob.exists():
+                # 不应发生：版本链在则 blob 在；给出明确错误而非 500
+                raise errors.ServiceError(
+                    "source version data missing on disk (possible corruption)",
+                    details={"checksum": src["checksum"], "version": version})
+
+            was_delete = meta.get("delete_marker", False)
+            nsrec = self.store.get_namespace(namespace)
+            assert nsrec is not None
+            quota = nsrec.get("quota_bytes", 0) or 0
+            used = nsrec.get("used_bytes", 0)
+            inflight = nsrec.get("inflight_bytes", 0)
+            old_size = 0 if was_delete else self._live_current_size(
+                namespace, object_name)
+            projected = used - old_size + src["size"]
+            if quota and projected + inflight > quota:
+                decision = (f"quota_restore:used={used},old_current={old_size},"
+                            f"restore_size={src['size']},inflight={inflight},"
+                            f"projected={projected},quota={quota}")
+                self.store.append_audit(
+                    {"action": "restore_reject", "namespace": namespace,
+                     "object": object_name, "from_version": version,
+                     "reason": "quota_exceeded", "decision": decision})
+                log.warning("restore_reject object=%s %s", object_name, decision)
+                raise errors.QuotaExceeded(
+                    "restore would exceed namespace quota",
+                    details={"used": used, "quota": quota,
+                             "projected": projected, "inflight": inflight,
+                             "restore_size": src["size"]},
+                )
+
+            version_no = meta["current_version"] + 1
+            new_version = {
+                "version": version_no,
+                "size": src["size"],
+                "checksum": src["checksum"],
+                "content_type": src["content_type"],
+                "metadata": dict(src.get("metadata", {})),
+                "created_at": iso(utcnow()),
+                "session_id": None,
+                "restored_from": version,
+            }
+            meta["versions"].append(new_version)
+            meta["current_version"] = version_no
+            meta["delete_marker"] = False
+
+            limit = nsrec.get("max_history_versions", 0) or 0
+            pruned = self._apply_retention_locked(namespace, meta, limit)
+            pruned_versions = [p["version"] for p in pruned]
+
+            self.store.put_object_meta(namespace, meta)
+            self.store.update_namespace(namespace, used_bytes=projected)
+
+            decision = (f"restore:v{version}->v{version_no},"
+                        f"was_delete_marker={was_delete},"
+                        f"replaced_current={old_size},"
+                        f"quota_after={projected},"
+                        f"retention_pruned={pruned_versions or 'none'}")
+            self.store.append_audit(
+                {"action": "object_restore", "namespace": namespace,
+                 "object": object_name, "from_version": version,
+                 "new_version": version_no, "checksum": src["checksum"],
+                 "was_delete_marker": was_delete,
+                 "retention_pruned": pruned_versions,
+                 "decision": decision})
+            log.info("object_restore ns=%s object=%s v%d->v%d %s",
+                     namespace, object_name, version, version_no, decision)
+            return RestoreResult(
+                namespace=namespace, object_name=object_name,
+                version=version_no, restored_from=version,
+                checksum=src["checksum"], size=src["size"],
+                was_delete_marker=was_delete, decision=decision)
 
     # ================= 回收 =================
     def purge_expired_sessions(self, namespace: str) -> dict[str, Any]:

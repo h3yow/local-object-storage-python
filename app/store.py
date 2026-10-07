@@ -102,7 +102,8 @@ class LocalStore:
         return self._read_registry().get(namespace)
 
     def create_namespace(
-        self, namespace: str, quota_bytes: int, tokens: list[str]
+        self, namespace: str, quota_bytes: int, tokens: list[str],
+        max_history_versions: int = 0,
     ) -> dict[str, Any]:
         reg = self._read_registry()
         if namespace in reg:
@@ -112,6 +113,8 @@ class LocalStore:
             "quota_bytes": int(quota_bytes),
             "tokens": list(tokens),
             "used_bytes": 0,
+            "inflight_bytes": 0,
+            "max_history_versions": int(max_history_versions),
         }
         reg[namespace] = record
         self._write_registry(reg)
