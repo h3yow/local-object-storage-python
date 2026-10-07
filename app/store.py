@@ -102,7 +102,8 @@ class LocalStore:
         return self._read_registry().get(namespace)
 
     def create_namespace(
-        self, namespace: str, quota_bytes: int, tokens: list[str]
+        self, namespace: str, quota_bytes: int, tokens: list[str],
+        max_history_versions: int | None = None,
     ) -> dict[str, Any]:
         reg = self._read_registry()
         if namespace in reg:
@@ -112,11 +113,16 @@ class LocalStore:
             "quota_bytes": int(quota_bytes),
             "tokens": list(tokens),
             "used_bytes": 0,
+            "inflight_bytes": 0,
+            "max_history_versions": max_history_versions,
         }
         reg[namespace] = record
         self._write_registry(reg)
         self._ns_dir(namespace).mkdir(parents=True, exist_ok=True)
         return record
+
+    def list_namespaces(self) -> list[str]:
+        return sorted(self._read_registry())
 
     def update_namespace(self, namespace: str, **changes: Any) -> dict[str, Any]:
         reg = self._read_registry()
@@ -125,6 +131,32 @@ class LocalStore:
         reg[namespace] = record
         self._write_registry(reg)
         return record
+
+    def reconcile_namespace_usage(self, namespace: str) -> dict[str, Any]:
+        """从磁盘真相重算命名空间用量并持久化（服务启动时调用，兼容旧数据）。
+
+        - used_bytes    = 所有对象全部保留版本的逻辑大小之和
+        - inflight_bytes = 仍处于 open 且未过期会话的已接收分段字节之和；
+          同时把每个会话的 ``inflight_bytes`` 字段规范化，保证后续
+          complete/abort/expire 的释放是幂等且不重复的。
+        """
+        used = 0
+        for meta in self.list_object_metas(namespace):
+            for v in meta.get("versions", []):
+                used += int(v.get("size", 0))
+        inflight = 0
+        now = utcnow()
+        for s in self.all_sessions(namespace):
+            counted = 0
+            if s.get("status") == "open" and parse_iso(s["expires_at"]) > now:
+                counted = sum(int(p.get("size", 0))
+                              for p in s.get("parts", {}).values())
+            if s.get("inflight_bytes") != counted:
+                s["inflight_bytes"] = counted
+                self.save_session(namespace, s)
+            inflight += counted
+        return self.update_namespace(
+            namespace, used_bytes=used, inflight_bytes=inflight)
 
     def _ns_dir(self, namespace: str) -> Path:
         return self.root / "ns" / namespace

@@ -114,6 +114,14 @@ class ObjectChecksumMismatch(ServiceError):
     error_code = "object_checksum_mismatch"
 
 
+# ---- 版本管理 ----
+class VersionInUse(ServiceError):
+    """试图直接删除当前生效版本（未被删除标记覆盖的对象）(409)。"""
+
+    status_code = 409
+    error_code = "version_in_use"
+
+
 # ---- 并发 / 配额 ----
 class VersionConflict(ServiceError):
     """乐观并发：客户端期望的当前版本与实际不符 (409)。"""

@@ -47,11 +47,14 @@ def caplog_pretty(caplog: pytest.LogCaptureFixture):
 @pytest.fixture
 def make_namespace(client: TestClient):
     def _make(name: str = "team-a", quota_bytes: int = 0,
-              tokens: list[str] | None = None) -> dict[str, Any]:
+              tokens: list[str] | None = None,
+              max_history_versions: int | None = None) -> dict[str, Any]:
         tokens = tokens if tokens is not None else ["token-a", "token-admin"]
-        r = client.post("/namespaces",
-                        json={"name": name, "quota_bytes": quota_bytes,
-                              "tokens": tokens})
+        body: dict[str, Any] = {"name": name, "quota_bytes": quota_bytes,
+                                "tokens": tokens}
+        if max_history_versions is not None:
+            body["max_history_versions"] = max_history_versions
+        r = client.post("/namespaces", json=body)
         assert r.status_code == 201, r.text
         return r.json()
     return _make

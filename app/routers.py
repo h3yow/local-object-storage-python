@@ -20,6 +20,8 @@ from .models import (
     NamespaceCreate,
     NamespaceInfo,
     ObjectInfo,
+    RestoreRequest,
+    RestoreResult,
     SessionCreate,
     SessionInfo,
 )
@@ -116,6 +118,24 @@ def list_objects(namespace: str,
 
 # 注意：/content 子路径必须在 {object_name:path} 通配之前注册，
 # 否则 path 转换器会吞掉 "/content" 段。
+# 同理，/versions/{version} 与 /restore 子路径也注册在通配路由之前。
+@router.delete("/namespaces/{namespace}/objects/{object_name:path}/versions/{version}")
+def delete_version(namespace: str, object_name: str, version: int,
+                   x_namespace_token: str | None = Header(default=None),
+                   svc: ObjectService = Depends(get_service)) -> dict:
+    svc.authorize(namespace, _token(x_namespace_token))
+    return svc.delete_version(namespace, object_name, version)
+
+
+@router.post("/namespaces/{namespace}/objects/{object_name:path}/restore",
+             response_model=RestoreResult, status_code=201)
+def restore_object(namespace: str, object_name: str, body: RestoreRequest,
+                   x_namespace_token: str | None = Header(default=None),
+                   svc: ObjectService = Depends(get_service)) -> RestoreResult:
+    svc.authorize(namespace, _token(x_namespace_token))
+    return svc.restore_object(namespace, object_name, body)
+
+
 @router.get("/namespaces/{namespace}/objects/{object_name:path}/content")
 def download_object(namespace: str, object_name: str,
                     version: int | None = Query(default=None),
